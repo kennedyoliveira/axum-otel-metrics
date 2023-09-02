@@ -245,48 +245,6 @@ impl HttpMetricsLayerBuilder {
     }
 
     pub fn build(self) -> HttpMetricsLayer {
-        let mut resource = vec![];
-
-        let ns = env::var("INSTANCE_NAMESPACE").unwrap_or_default();
-        if !ns.is_empty() {
-            resource.push(SERVICE_NAMESPACE.string(ns.clone()));
-        }
-
-        let instance_ip = env::var("INSTANCE_IP").unwrap_or_default();
-        if !instance_ip.is_empty() {
-            resource.push(SERVICE_INSTANCE.string(instance_ip));
-        }
-
-        if let Some(service_name) = self.service_name {
-            // `foo.ns`
-            if !ns.is_empty() && !service_name.starts_with(format!("{}.", &ns).as_str()) {
-                resource.push(SERVICE_NAME.string(format!("{}.{}", service_name, &ns)));
-            } else {
-                resource.push(SERVICE_NAME.string(service_name));
-            }
-        }
-        if let Some(service_version) = self.service_version {
-            resource.push(SERVICE_VERSION.string(service_version));
-        }
-
-        let res = Resource::from_detectors(
-            Duration::from_secs(6),
-            vec![
-                // set service.name from env OTEL_SERVICE_NAME > env OTEL_RESOURCE_ATTRIBUTES > option_env! CARGO_BIN_NAME > unknown_service
-                Box::new(SdkProvidedResourceDetector),
-                // detect res from env OTEL_RESOURCE_ATTRIBUTES (resources string like key1=value1,key2=value2,...)
-                Box::new(EnvResourceDetector::new()),
-                // set telemetry.sdk.{name, language, version}
-                Box::new(TelemetryResourceDetector),
-            ],
-        );
-
-        let res = if !resource.is_empty() {
-            res.merge(&mut Resource::new(resource))
-        } else {
-            res
-        };
-
         let registry = if let Some(registry) = self.registry {
             registry
         } else if let Some(prefix) = self.prefix {
@@ -298,6 +256,48 @@ impl HttpMetricsLayerBuilder {
         let provider = if let Some(provider) = self.meter_provider {
             provider
         } else {
+            let mut resource = vec![];
+
+            let ns = env::var("INSTANCE_NAMESPACE").unwrap_or_default();
+            if !ns.is_empty() {
+                resource.push(SERVICE_NAMESPACE.string(ns.clone()));
+            }
+
+            let instance_ip = env::var("INSTANCE_IP").unwrap_or_default();
+            if !instance_ip.is_empty() {
+                resource.push(SERVICE_INSTANCE.string(instance_ip));
+            }
+
+            if let Some(service_name) = self.service_name {
+                // `foo.ns`
+                if !ns.is_empty() && !service_name.starts_with(format!("{}.", &ns).as_str()) {
+                    resource.push(SERVICE_NAME.string(format!("{}.{}", service_name, &ns)));
+                } else {
+                    resource.push(SERVICE_NAME.string(service_name));
+                }
+            }
+            if let Some(service_version) = self.service_version {
+                resource.push(SERVICE_VERSION.string(service_version));
+            }
+
+            let res = Resource::from_detectors(
+                Duration::from_secs(6),
+                vec![
+                    // set service.name from env OTEL_SERVICE_NAME > env OTEL_RESOURCE_ATTRIBUTES > option_env! CARGO_BIN_NAME > unknown_service
+                    Box::new(SdkProvidedResourceDetector),
+                    // detect res from env OTEL_RESOURCE_ATTRIBUTES (resources string like key1=value1,key2=value2,...)
+                    Box::new(EnvResourceDetector::new()),
+                    // set telemetry.sdk.{name, language, version}
+                    Box::new(TelemetryResourceDetector),
+                ],
+            );
+
+            let res = if !resource.is_empty() {
+                res.merge(&mut Resource::new(resource))
+            } else {
+                res
+            };
+
             // init prometheus exporter
             let exporter = opentelemetry_prometheus::exporter()
                 .with_registry(registry.clone())
