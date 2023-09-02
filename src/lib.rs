@@ -202,6 +202,7 @@ pub struct HttpMetricsLayerBuilder {
     is_tls: bool,
     registry: Option<Registry>,
     meter_provider: Option<MeterProvider>,
+    meter_name: Option<String>,
 }
 
 impl HttpMetricsLayerBuilder {
@@ -241,6 +242,11 @@ impl HttpMetricsLayerBuilder {
 
     pub fn with_meter_provider(mut self, meter_provider: MeterProvider) -> Self {
         self.meter_provider = Some(meter_provider);
+        self
+    }
+
+    pub fn with_meter_name(mut self, meter_name: String) -> Self {
+        self.meter_name = Some(meter_name);
         self
     }
 
@@ -347,7 +353,7 @@ impl HttpMetricsLayerBuilder {
 
         // this must called after the global meter provider has ben initialized
         // let meter = global::meter("axum-app");
-        let meter = provider.meter("axum-app");
+        let meter = provider.meter(self.meter_name.unwrap_or("axum-app".to_string()));
 
         // requests_total
         let requests_total = meter
