@@ -200,6 +200,8 @@ pub struct HttpMetricsLayerBuilder {
     labels: Option<HashMap<String, String>>,
     skipper: PathSkipper,
     is_tls: bool,
+    registry: Option<Registry>,
+    meter_provider: Option<MeterProvider>,
 }
 
 impl HttpMetricsLayerBuilder {
@@ -229,6 +231,16 @@ impl HttpMetricsLayerBuilder {
 
     pub fn with_skipper(mut self, skipper: PathSkipper) -> Self {
         self.skipper = skipper;
+        self
+    }
+
+    pub fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub fn with_meter_provider(mut self, meter_provider: MeterProvider) -> Self {
+        self.meter_provider = Some(meter_provider);
         self
     }
 
@@ -275,54 +287,64 @@ impl HttpMetricsLayerBuilder {
             res
         };
 
-        let registry = if let Some(prefix) = self.prefix {
+        let registry = if let Some(registry) = self.registry {
+            registry
+        } else if let Some(prefix) = self.prefix {
             Registry::new_custom(Some(prefix), self.labels).expect("create prometheus registry")
         } else {
             Registry::new()
         };
-        // init prometheus exporter
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(registry.clone())
-            .build()
-            .unwrap();
 
-        let provider = MeterProvider::builder()
-            .with_resource(res)
-            .with_reader(exporter)
-            .with_view(
-                new_view(
-                    Instrument::new().name("*http.server.request.duration"),
-                    Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-                        boundaries: HTTP_REQ_DURATION_HISTOGRAM_BUCKETS.to_vec(),
-                        record_min_max: true,
-                    }),
-                )
-                .unwrap(),
-            )
-            .with_view(
-                new_view(
-                    Instrument::new().name("*http.server.request.size"),
-                    Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-                        boundaries: HTTP_REQ_SIZE_HISTOGRAM_BUCKETS.to_vec(),
-                        record_min_max: true,
-                    }),
-                )
-                .unwrap(),
-            )
-            .with_view(
-                new_view(
-                    Instrument::new().name("*http.server.response.size"),
-                    Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
-                        boundaries: HTTP_REQ_SIZE_HISTOGRAM_BUCKETS.to_vec(),
-                        record_min_max: true,
-                    }),
-                )
-                    .unwrap(),
-            )
-            .build();
+        let provider = if let Some(provider) = self.meter_provider {
+            provider
+        } else {
+            // init prometheus exporter
+            let exporter = opentelemetry_prometheus::exporter()
+                .with_registry(registry.clone())
+                .build()
+                .unwrap();
 
-        // init the global meter provider
-        global::set_meter_provider(provider.clone());
+            let provider = MeterProvider::builder()
+                .with_resource(res)
+                .with_reader(exporter)
+                .with_view(
+                    new_view(
+                        Instrument::new().name("*http.server.request.duration"),
+                        Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
+                            boundaries: HTTP_REQ_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+                            record_min_max: true,
+                        }),
+                    )
+                        .unwrap(),
+                )
+                .with_view(
+                    new_view(
+                        Instrument::new().name("*http.server.request.size"),
+                        Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
+                            boundaries: HTTP_REQ_SIZE_HISTOGRAM_BUCKETS.to_vec(),
+                            record_min_max: true,
+                        }),
+                    )
+                        .unwrap(),
+                )
+                .with_view(
+                    new_view(
+                        Instrument::new().name("*http.server.response.size"),
+                        Stream::new().aggregation(Aggregation::ExplicitBucketHistogram {
+                            boundaries: HTTP_REQ_SIZE_HISTOGRAM_BUCKETS.to_vec(),
+                            record_min_max: true,
+                        }),
+                    )
+                        .unwrap(),
+                )
+                .build();
+
+            // init the global meter provider
+            global::set_meter_provider(provider.clone());
+
+            provider
+        };
+
         // this must called after the global meter provider has ben initialized
         // let meter = global::meter("axum-app");
         let meter = provider.meter("axum-app");
