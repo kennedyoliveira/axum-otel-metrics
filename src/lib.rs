@@ -52,6 +52,7 @@ use axum::http::Response;
 use axum::{extract::MatchedPath, extract::State, http::Request, response::IntoResponse, routing::get, Router};
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::future::Future;
@@ -68,8 +69,8 @@ use opentelemetry::metrics::{Counter, Histogram, UpDownCounter};
 
 use opentelemetry::metrics::{MeterProvider as _, Unit};
 
-use opentelemetry::sdk::metrics::{new_view, Aggregation, Instrument, MeterProvider, Stream};
-use opentelemetry::sdk::resource::{EnvResourceDetector, SdkProvidedResourceDetector, TelemetryResourceDetector};
+use opentelemetry_sdk::metrics::{new_view, Aggregation, Instrument, SdkMeterProvider, Stream};
+use opentelemetry_sdk::resource::{EnvResourceDetector, SdkProvidedResourceDetector, TelemetryResourceDetector};
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_NAMESPACE, SERVICE_VERSION};
 
 use opentelemetry::global;
@@ -77,10 +78,10 @@ use opentelemetry::global;
 use tower::{Layer, Service};
 
 use futures_util::ready;
-use opentelemetry::sdk::Resource;
-use pin_project_lite::pin_project;
-use http_body::Body as httpBody; // for `Body::size_hint`
-// service.instance used by Tencent Cloud TKE APM only, for view application metrics by pod IP
+use http_body::Body as httpBody;
+use opentelemetry_sdk::Resource;
+use pin_project_lite::pin_project; // for `Body::size_hint`
+                                   // service.instance used by Tencent Cloud TKE APM only, for view application metrics by pod IP
 const SERVICE_INSTANCE: Key = Key::from_static_str("service.instance");
 
 /// the metrics we used in the middleware
@@ -129,6 +130,7 @@ pub struct HttpMetrics<S> {
 pub struct HttpMetricsLayer {
     /// the metric state, use both by the middleware handler and metrics export endpoint
     pub(crate) state: MetricState,
+    path: String,
 }
 
 // TODO support custom buckets
@@ -136,7 +138,9 @@ pub struct HttpMetricsLayer {
 // as https://github.com/open-telemetry/semantic-conventions/blob/main/docs/http/http-metrics.md#metric-httpserverrequestduration spec
 // This metric SHOULD be specified with ExplicitBucketBoundaries of [ 0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10 ].
 // the unit of the buckets is second
-const HTTP_REQ_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0];
+const HTTP_REQ_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
 
 const KB: f64 = 1024.0;
 const MB: f64 = 1024.0 * KB;
@@ -157,7 +161,7 @@ const HTTP_REQ_SIZE_HISTOGRAM_BUCKETS: &[f64] = &[
 impl HttpMetricsLayer {
     pub fn routes<S>(&self) -> Router<S> {
         Router::new()
-            .route("/metrics", get(Self::exporter_handler))
+            .route(self.path.as_str(), get(Self::exporter_handler))
             .with_state(self.state.clone())
     }
 
@@ -173,30 +177,61 @@ impl HttpMetricsLayer {
     }
 }
 
+/// A helper that instructs the metrics layer to ignore
+/// certain paths.
+///
+/// The [HttpMetricsLayerBuilder] uses this helper during the
+/// construction of the [HttpMetricsLayer] that will be called
+/// by Axum / Hyper / Tower when a request comes in.
 #[derive(Clone)]
 pub struct PathSkipper {
-    skip: fn(&str) -> bool,
+    skip: Arc<dyn Fn(&str) -> bool + 'static + Send + Sync>,
 }
 
 impl PathSkipper {
+    /// Returns a [PathSkipper] that skips recording metrics
+    /// for requests whose path, when passed to `fn`, returns
+    /// `true`.
+    ///
+    /// Only static functions are accepted -- callables such
+    /// as closures that capture their surrounding context will
+    /// not work here.  For a variant that works, consult the
+    /// [PathSkipper::new_with_fn] method.
     pub fn new(skip: fn(&str) -> bool) -> Self {
-        Self { skip }
+        Self { skip: Arc::new(skip) }
+    }
+
+    /// Dynamic variant of [PathSkipper::new].
+    ///
+    /// This variant requires the callable to be wrapped in an
+    /// [Arc] but, in exchange for this requirement, the caller
+    /// can use closures that capture variables from their context.
+    ///
+    /// The callable argument *must be thread-safe*.  You, as
+    /// the implementor and user of this code, have that
+    /// responsibility.
+    pub fn new_with_fn(skip: Arc<dyn Fn(&str) -> bool + 'static + Send + Sync>) -> Self {
+        Self { skip: skip }
     }
 }
 
 impl Default for PathSkipper {
+    /// Returns a `PathSkipper` that skips any path which
+    /// starts with `/metrics` or `/favicon.ico``.
+    ///
+    /// This is the default implementation used when
+    /// building an HttpMetricsLayerBuilder from scratch.
     fn default() -> Self {
-        Self {
-            skip: |s| s.starts_with("/metrics") || s.starts_with("/favicon.ico"),
-        }
+        Self::new(|s| s.starts_with("/metrics") || s.starts_with("/favicon.ico"))
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct HttpMetricsLayerBuilder {
     service_name: Option<String>,
     service_version: Option<String>,
     prefix: Option<String>,
+    path: String,
     labels: Option<HashMap<String, String>>,
     skipper: PathSkipper,
     is_tls: bool,
@@ -205,9 +240,23 @@ pub struct HttpMetricsLayerBuilder {
     meter_name: Option<String>,
 }
 
+impl Default for HttpMetricsLayerBuilder {
+    fn default() -> Self {
+        Self {
+            service_name: None,
+            service_version: None,
+            prefix: None,
+            path: "/metrics".to_string(),
+            labels: None,
+            skipper: PathSkipper::default(),
+            is_tls: false,
+        }
+    }
+}
+
 impl HttpMetricsLayerBuilder {
     pub fn new() -> Self {
-        Self::default()
+        HttpMetricsLayerBuilder::default()
     }
 
     pub fn with_service_name(mut self, service_name: String) -> Self {
@@ -222,6 +271,11 @@ impl HttpMetricsLayerBuilder {
 
     pub fn with_prefix(mut self, prefix: String) -> Self {
         self.prefix = Some(prefix);
+        self
+    }
+
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path = path;
         self
     }
 
@@ -266,24 +320,24 @@ impl HttpMetricsLayerBuilder {
 
             let ns = env::var("INSTANCE_NAMESPACE").unwrap_or_default();
             if !ns.is_empty() {
-                resource.push(SERVICE_NAMESPACE.string(ns.clone()));
+                resource.push(KeyValue::new(SERVICE_NAMESPACE, ns.clone()));
             }
 
             let instance_ip = env::var("INSTANCE_IP").unwrap_or_default();
             if !instance_ip.is_empty() {
-                resource.push(SERVICE_INSTANCE.string(instance_ip));
+                resource.push(KeyValue::new(SERVICE_INSTANCE, instance_ip));
             }
 
             if let Some(service_name) = self.service_name {
                 // `foo.ns`
                 if !ns.is_empty() && !service_name.starts_with(format!("{}.", &ns).as_str()) {
-                    resource.push(SERVICE_NAME.string(format!("{}.{}", service_name, &ns)));
+                    resource.push(KeyValue::new(SERVICE_NAME, format!("{}.{}", service_name, &ns)));
                 } else {
-                    resource.push(SERVICE_NAME.string(service_name));
+                    resource.push(KeyValue::new(SERVICE_NAME, service_name));
                 }
             }
             if let Some(service_version) = self.service_version {
-                resource.push(SERVICE_VERSION.string(service_version));
+                resource.push(KeyValue::new(SERVICE_VERSION, service_version));
             }
 
             let res = Resource::from_detectors(
@@ -310,7 +364,7 @@ impl HttpMetricsLayerBuilder {
                 .build()
                 .unwrap();
 
-            let provider = MeterProvider::builder()
+            let provider = SdkMeterProvider::builder()
                 .with_resource(res)
                 .with_reader(exporter)
                 .with_view(
@@ -400,7 +454,10 @@ impl HttpMetricsLayerBuilder {
             is_tls: self.is_tls,
         };
 
-        HttpMetricsLayer { state: meter_state }
+        HttpMetricsLayer {
+            state: meter_state,
+            path: self.path,
+        }
     }
 }
 
@@ -447,14 +504,16 @@ where
         let url_scheme = if self.state.is_tls {
             "https".to_string()
         } else {
-            (||{
+            (|| {
                 if let Some(scheme) = req.headers().get("X-Forwarded-Proto") {
                     return scheme.to_str().unwrap().to_string();
                 } else if let Some(scheme) = req.headers().get("X-Forwarded-Protocol") {
                     return scheme.to_str().unwrap().to_string();
-                } if req.headers().get("X-Forwarded-Ssl").is_some().to_string() == "on" {
+                }
+                if req.headers().get("X-Forwarded-Ssl").is_some().to_string() == "on" {
                     return "https".to_string();
-                } if let Some(scheme) = req.headers().get("X-Url-Scheme") {
+                }
+                if let Some(scheme) = req.headers().get("X-Url-Scheme") {
                     return scheme.to_str().unwrap().to_string();
                 } else {
                     return "http".to_string();
@@ -463,10 +522,13 @@ where
         };
         // ref https://github.com/open-telemetry/semantic-conventions/blob/main/docs/http/http-metrics.md#metric-httpserveractive_requests
         // http.request.method and url.scheme is required
-        self.state.metric.req_active.add(1, &[
-            KeyValue::new("http.request.method", req.method().as_str().to_string()),
-            KeyValue::new("url.scheme", url_scheme.clone()),
-        ]);
+        self.state.metric.req_active.add(
+            1,
+            &[
+                KeyValue::new("http.request.method", req.method().as_str().to_string()),
+                KeyValue::new("url.scheme", url_scheme.clone()),
+            ],
+        );
         let start = Instant::now();
         let method = req.method().clone().to_string();
         let path = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
@@ -475,8 +537,12 @@ where
             "".to_owned()
         };
 
-        let host = req.headers().get(http::header::HOST)
-            .and_then(|h| h.to_str().ok()).unwrap_or("unknown").to_string();
+        let host = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
 
         let req_size = compute_approximate_request_size(&req);
 
@@ -495,7 +561,6 @@ where
         }
     }
 }
-
 
 /// compute approximate request size
 ///
@@ -530,10 +595,13 @@ where
         let this = self.project();
         let response = ready!(this.inner.poll(cx))?;
 
-        this.state.metric.req_active.add(-1, &[
-            KeyValue::new("http.request.method", this.method.clone()),
-            KeyValue::new("url.scheme", this.url_scheme.clone()),
-        ]);
+        this.state.metric.req_active.add(
+            -1,
+            &[
+                KeyValue::new("http.request.method", this.method.clone()),
+                KeyValue::new("url.scheme", this.url_scheme.clone()),
+            ],
+        );
 
         if (this.state.skipper.skip)(this.path.as_str()) {
             return Poll::Ready(Ok(response));
@@ -551,7 +619,6 @@ where
             },
             KeyValue::new("http.route", this.path.clone()),
             KeyValue::new("http.response.status_code", status),
-
             // server.address: Name of the local HTTP server that received the request.
             // Determined by using the first of the following that applies
             //
@@ -579,13 +646,14 @@ mod tests {
     use axum::extract::State;
     use axum::routing::get;
     use axum::Router;
-    use opentelemetry::sdk::metrics::MeterProvider;
     use opentelemetry::{global, Context, KeyValue};
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
     use prometheus::{Encoder, Registry, TextEncoder};
+    use std::sync::Arc;
 
     #[test]
     fn test_prometheus_exporter() {
-        let cx = Context::current();
+        let _cx = Context::current();
 
         let registry = Registry::new();
 
@@ -595,7 +663,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let provider = MeterProvider::builder().with_reader(exporter).build();
+        let provider = SdkMeterProvider::builder().with_reader(exporter).build();
 
         // init the global meter provider
         global::set_meter_provider(provider.clone());
@@ -604,9 +672,9 @@ mod tests {
 
         // Use two instruments
         let counter = meter.u64_counter("a.counter").with_description("Counts things").init();
-        let recorder = meter.i64_histogram("a.histogram").with_description("Records values").init();
+        let recorder = meter.u64_histogram("a.histogram").with_description("Records values").init();
 
-        counter.add( 100, &[KeyValue::new("key", "value")]);
+        counter.add(100, &[KeyValue::new("key", "value")]);
         recorder.record(100, &[KeyValue::new("key", "value")]);
 
         // Encode data as text or protobuf
@@ -646,6 +714,27 @@ mod tests {
             .route("/", get(handler))
             .route("/hello", get(handler))
             .route("/world", get(handler))
+            // add the metrics middleware
+            .layer(metrics)
+            .with_state(AppState {});
+
+        async fn handler(_state: State<AppState>) -> &'static str {
+            "<h1>Hello, World!</h1>"
+        }
+    }
+
+    #[test]
+    fn test_builder_with_arced_skipper() {
+        #[derive(Clone)]
+        struct AppState {}
+
+        let metrics = HttpMetricsLayerBuilder::new()
+            .with_skipper(crate::PathSkipper::new_with_fn(Arc::new(|_: &str| true)))
+            .build();
+        let _app: Router<AppState> = Router::new()
+            // export metrics at `/metrics` endpoint
+            .merge(metrics.routes::<AppState>())
+            .route("/", get(handler))
             // add the metrics middleware
             .layer(metrics)
             .with_state(AppState {});
