@@ -236,7 +236,7 @@ pub struct HttpMetricsLayerBuilder {
     skipper: PathSkipper,
     is_tls: bool,
     registry: Option<Registry>,
-    meter_provider: Option<MeterProvider>,
+    meter_provider: Option<SdkMeterProvider>,
     meter_name: Option<String>,
 }
 
@@ -250,6 +250,9 @@ impl Default for HttpMetricsLayerBuilder {
             labels: None,
             skipper: PathSkipper::default(),
             is_tls: false,
+            registry: None,
+            meter_provider: None,
+            meter_name: None,
         }
     }
 }
@@ -294,7 +297,7 @@ impl HttpMetricsLayerBuilder {
         self
     }
 
-    pub fn with_meter_provider(mut self, meter_provider: MeterProvider) -> Self {
+    pub fn with_meter_provider(mut self, meter_provider: SdkMeterProvider) -> Self {
         self.meter_provider = Some(meter_provider);
         self
     }
